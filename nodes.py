@@ -1,4 +1,7 @@
+import csv
+import math
 import os
+from urllib import request
 import torch
 from torchvision import transforms
 
@@ -1741,6 +1744,201 @@ class ExtractFluxLoRA:
         )
      
         return (outpath,)
+    
+class DataSetDownloader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "dataset": ("STRING", {"default": "dataset_name", "tooltip": "the name of the dataset to download"}),
+        }}
+    
+    RETURN_TYPES = ("STRING", )
+    RETURN_NAMES = ("output_path",)
+    FUNCTION = "download"
+    CATEGORY = "FluxTrainer"
+    
+    def download(self, dataset):
+        # json parse
+        import json
+        dataset_json = json.loads(dataset)
+        # {
+        #     "public_id": "public_id",
+        #     "name": "dataset_name",
+        #     "description": "dataset_description",
+        #     "trigger_word": "trigger_word",
+        #     "data": [
+        #         {
+        #             "image_name": "image_name",
+        #             "image_url": "image_url",
+        #             "tags": "tags",
+        #         },
+        #         {
+        #             "image_name": "image_name",
+        #             "image_url": "image_url",
+        #             "tags": "tags",
+        #         }
+        #     ]
+        # }
+        # 1. 创建 dataset 目录
+        dataset_dir = os.path.join(os.path.expanduser("~"), "ComfyUI", "datasets", dataset_json["public_id"])
+        # 2. 循环处理数据
+        for data in dataset_json["data"]:
+            # 2.1 下载图片到 dataset_dir
+            image_url = data["image_url"]
+            image_path = os.path.join(dataset_dir, data["image_name"] + ".png")
+            if not os.path.exists(image_path):
+                response = request.get(image_url)
+                with open(image_path, "wb") as f:
+                    f.write(response.content)
+            # 2.2 创建 caption 文件，文件名与其 image_name 一致，内容为 tags 拼接
+            caption_path = os.path.join(dataset_dir, data["image_name"] + ".txt")
+            with open(caption_path, "w") as f:
+                f.write(data["tags"])
+        # 3. 返回 dataset_dir
+        return (dataset_dir,)
+    
+
+class FluxEpochTrainLoop:  
+    @classmethod  
+    def INPUT_TYPES(cls):  
+        return {"required": {  
+            "network_trainer": ("NETWORKTRAINER",),  
+            "validate_every_n_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "validate and generate images every n epochs"}),  
+            "save_every_n_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "save model every n epochs"}),  
+            "export_loss_data": ("BOOLEAN", {"default": True, "tooltip": "export loss data to CSV file"}),  
+            },  
+             "optional": {  
+                "validation_settings": ("VALSETTINGS",),  
+            }  
+        }  
+  
+    RETURN_TYPES = ("NETWORKTRAINER", "INT", "IMAGE", "STRING",)  
+    RETURN_NAMES = ("network_trainer", "completed_epochs", "validation_images", "loss_data_path",)  
+    FUNCTION = "train"  
+    CATEGORY = "FluxTrainer"  
+  
+    def train(self, network_trainer, validate_every_n_epochs, save_every_n_epochs, export_loss_data, validation_settings=None):  
+        with torch.inference_mode(False):  
+            training_loop = network_trainer["training_loop"]  
+            network_trainer = network_trainer["network_trainer"]  
+              
+            # 计算每个 epoch 的步数  
+            args = network_trainer.args  
+            num_update_steps_per_epoch = math.ceil(len(network_trainer.train_dataloader) / args.gradient_accumulation_steps)  
+              
+            # 如果设置了 max_train_epochs，使用它；否则从 max_train_steps 计算  
+            if hasattr(args, 'max_train_epochs') and args.max_train_epochs is not None:  
+                target_epochs = args.max_train_epochs  
+                target_global_step = target_epochs * num_update_steps_per_epoch  
+            else:  
+                target_global_step = args.max_train_steps  
+                target_epochs = math.ceil(target_global_step / num_update_steps_per_epoch)  
+              
+            comfy_pbar = comfy.utils.ProgressBar(target_global_step)  
+            network_trainer.comfy_pbar = comfy_pbar  
+              
+            network_trainer.optimizer_train_fn()  
+              
+            validation_images = []  
+            loss_data_path = ""  
+              
+            # 训练循环  
+            current_epoch = 0  
+            while current_epoch < target_epochs and network_trainer.global_step < target_global_step:  
+                # 计算当前 epoch 结束时的步数  
+                epoch_end_step = (current_epoch + 1) * num_update_steps_per_epoch  
+                epoch_end_step = min(epoch_end_step, target_global_step)  
+                  
+                # 运行一个完整的 epoch  
+                steps_done = training_loop(  
+                    break_at_steps=epoch_end_step,  
+                    epoch=current_epoch,  
+                )  
+                  
+                current_epoch += 1  
+                  
+                # 检查是否需要验证  
+                if current_epoch % validate_every_n_epochs == 0:  
+                    current_validation_images = self.validate(network_trainer, validation_settings) 
+                    validation_images.append(current_validation_images)
+                    print(f"Validation completed at epoch {current_epoch}")  
+                  
+                # 检查是否需要保存  
+                if current_epoch % save_every_n_epochs == 0:  
+                    self.save(network_trainer)  
+                    print(f"Model saved at epoch {current_epoch}")  
+                  
+                # 导出损失数据  
+                if export_loss_data:  
+                    loss_data_path = self.export_loss_data(network_trainer, current_epoch)  
+                  
+                # 如果达到最大训练步数则退出  
+                if network_trainer.global_step >= target_global_step:  
+                    break  
+              
+            # 最终验证和保存  
+            if len(validation_images) == 0:  
+                validation_images = self.validate(network_trainer, validation_settings)  
+                validation_images.append(validation_images)
+              
+            trainer = {  
+                "network_trainer": network_trainer,  
+                "training_loop": training_loop,  
+            }  
+              
+            return (trainer, current_epoch, validation_images, loss_data_path)  
+  
+    def validate(self, network_trainer, validation_settings=None):  
+        params = (   
+            network_trainer.current_epoch.value,   
+            network_trainer.global_step,  
+            validation_settings  
+        )  
+        network_trainer.optimizer_eval_fn()  
+        image_tensors = network_trainer.sample_images(*params)  
+        network_trainer.optimizer_train_fn()  
+          
+        # 转换图像张量格式以便输出  
+        if image_tensors is not None:  
+            return (0.5 * (image_tensors + 1.0)).cpu().float()  
+        else:  
+            # 返回空图像张量  
+            return torch.zeros((1, 512, 512, 3))  
+  
+    def save(self, network_trainer):  
+        ckpt_name = train_util.get_step_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as, network_trainer.global_step)  
+        network_trainer.optimizer_eval_fn()  
+        network_trainer.save_model(ckpt_name, network_trainer.accelerator.unwrap_model(network_trainer.network), network_trainer.global_step, network_trainer.current_epoch.value + 1)  
+        network_trainer.optimizer_train_fn()  
+  
+    def export_loss_data(self, network_trainer, current_epoch):  
+        """导出损失数据到 CSV 文件"""  
+        try:  
+            loss_values = network_trainer.loss_recorder.global_loss_list  
+              
+            if not loss_values:  
+                return ""  
+              
+            # 创建输出目录  
+            output_dir = network_trainer.args.output_dir  
+            loss_data_path = os.path.join(output_dir, f"loss_data_epoch_{current_epoch}.csv")  
+              
+            # 写入 CSV 文件  
+            with open(loss_data_path, 'w', newline='', encoding='utf-8') as csvfile:  
+                writer = csv.writer(csvfile)  
+                writer.writerow(['Step', 'Loss', 'Epoch'])  
+                  
+                for i, loss in enumerate(loss_values):  
+                    # 估算对应的 epoch（简化计算）  
+                    estimated_epoch = i // (len(loss_values) // max(current_epoch, 1)) + 1  
+                    writer.writerow([i + 1, loss, estimated_epoch])  
+              
+            print(f"Loss data exported to: {loss_data_path}")  
+            return loss_data_path  
+              
+        except Exception as e:  
+            print(f"Error exporting loss data: {e}")  
+            return ""
 
 NODE_CLASS_MAPPINGS = {
     "InitFluxLoRATraining": InitFluxLoRATraining,
@@ -1768,6 +1966,8 @@ NODE_CLASS_MAPPINGS = {
     "OptimizerConfigProdigyPlusScheduleFree": OptimizerConfigProdigyPlusScheduleFree,
     "FluxTrainerLossConfig": FluxTrainerLossConfig,
     "TrainNetworkConfig": TrainNetworkConfig,
+    "FluxEpochTrainLoop": FluxEpochTrainLoop,
+    "DataSetDownloader": DataSetDownloader,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InitFluxLoRATraining": "Init Flux LoRA Training",
@@ -1795,4 +1995,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OptimizerConfigProdigyPlusScheduleFree": "Optimizer Config ProdigyPlusScheduleFree",
     "FluxTrainerLossConfig": "Flux Trainer Loss Config",
     "TrainNetworkConfig": "Train Network Config",
+    "FluxEpochTrainLoop": "Flux Epoch Train Loop",
+    "DataSetDownloader": "DataSet Downloader",
 }
