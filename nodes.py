@@ -1,7 +1,7 @@
 import csv
 import math
 import os
-from urllib import request
+import requests
 import torch
 from torchvision import transforms
 
@@ -1787,7 +1787,11 @@ class DataSetDownloader:
             image_url = data["image_url"]
             image_path = os.path.join(dataset_dir, data["image_name"] + ".png")
             if not os.path.exists(image_path):
-                response = request.get(image_url)
+                print(f"Downloading image from {image_url} to {image_path}")
+                # 2.1.1 创建目录
+                os.makedirs(os.path.dirname(image_path), exist_ok=True)
+                # 2.1.2 下载图片
+                response = requests.get(image_url)
                 with open(image_path, "wb") as f:
                     f.write(response.content)
             # 2.2 创建 caption 文件，文件名与其 image_name 一致，内容为 tags 拼接
