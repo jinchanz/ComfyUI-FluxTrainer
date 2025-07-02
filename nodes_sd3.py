@@ -453,7 +453,10 @@ class SD3TrainValidate:
             "network_trainer": network_trainer,
             "training_loop": training_loop,
         }
-        return (trainer, (0.5 * (image_tensors + 1.0)).cpu().float(),)
+        # 确保数据类型和值范围正确
+        processed_images = (0.5 * (image_tensors + 1.0)).cpu().float()
+        processed_images = torch.clamp(processed_images, 0.0, 1.0)
+        return (trainer, processed_images)
     
 NODE_CLASS_MAPPINGS = {
     "SD3ModelSelect": SD3ModelSelect,

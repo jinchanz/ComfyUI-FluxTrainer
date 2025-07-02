@@ -1268,7 +1268,10 @@ class FluxTrainValidate:
             "network_trainer": network_trainer,
             "training_loop": training_loop,
         }
-        return (trainer, (0.5 * (image_tensors + 1.0)).cpu().float(),)
+        # 确保数据类型和值范围正确
+        processed_images = (0.5 * (image_tensors + 1.0)).cpu().float()
+        processed_images = torch.clamp(processed_images, 0.0, 1.0)
+        return (trainer, processed_images)
     
 class VisualizeLoss:
     @classmethod
@@ -1604,7 +1607,10 @@ class FluxKohyaInferenceSampler:
         x = x.clamp(-1, 1)
         x = x.permute(0, 2, 3, 1)
 
-        return ((0.5 * (x + 1.0)).cpu().float(),)   
+        # 确保数据类型和值范围正确
+        processed_image = (0.5 * (x + 1.0)).cpu().float()
+        processed_image = torch.clamp(processed_image, 0.0, 1.0)
+        return (processed_image,)   
 
 class UploadToHuggingFace:
     @classmethod
@@ -1762,30 +1768,30 @@ class DataSetDownloader:
         import json
         dataset_json = json.loads(dataset)
         # {
-        #     "public_id": "public_id",
+        #     "publicId": "public_id",
         #     "name": "dataset_name",
         #     "description": "dataset_description",
-        #     "trigger_word": "trigger_word",
+        #     "triggerWord": "trigger_word",
         #     "data": [
         #         {
-        #             "image_name": "image_name",
-        #             "image_url": "image_url",
+        #             "imageName": "image_name",
+        #             "imageUrl": "image_url",
         #             "tags": "tags",
         #         },
         #         {
-        #             "image_name": "image_name",
-        #             "image_url": "image_url",
+        #             "imageName": "image_name",
+        #             "imageUrl": "image_url",
         #             "tags": "tags",
         #         }
         #     ]
         # }
         # 1. 创建 dataset 目录
-        dataset_dir = os.path.join(os.path.expanduser("~"), "ComfyUI", "datasets", dataset_json["public_id"])
+        dataset_dir = os.path.join(os.path.expanduser("~"), "ComfyUI", "datasets", dataset_json["publicId"])
         # 2. 循环处理数据
         for data in dataset_json["data"]:
             # 2.1 下载图片到 dataset_dir
-            image_url = data["image_url"]
-            image_path = os.path.join(dataset_dir, data["image_name"] + ".png")
+            image_url = data["imageUrl"]
+            image_path = os.path.join(dataset_dir, data["imageName"] + ".png")
             if not os.path.exists(image_path):
                 print(f"Downloading image from {image_url} to {image_path}")
                 # 2.1.1 创建目录
@@ -1795,7 +1801,7 @@ class DataSetDownloader:
                 with open(image_path, "wb") as f:
                     f.write(response.content)
             # 2.2 创建 caption 文件，文件名与其 image_name 一致，内容为 tags 拼接
-            caption_path = os.path.join(dataset_dir, data["image_name"] + ".txt")
+            caption_path = os.path.join(dataset_dir, data["imageName"] + ".txt")
             with open(caption_path, "w") as f:
                 f.write(data["tags"])
         # 3. 返回 dataset_dir
@@ -1816,8 +1822,8 @@ class FluxEpochTrainLoop:
             }  
         }  
   
-    RETURN_TYPES = ("NETWORKTRAINER", "INT", "IMAGE", "STRING",)  
-    RETURN_NAMES = ("network_trainer", "completed_epochs", "validation_images", "loss_data_path",)  
+    RETURN_TYPES = ("NETWORKTRAINER", "INT", "IMAGE", "STRING", "STRING", "STRING",)  
+    RETURN_NAMES = ("network_trainer", "completed_epochs", "validation_images", "lora_file_paths", "loss_data", "loss_data_path",)  
     FUNCTION = "train"  
     CATEGORY = "FluxTrainer"  
   
@@ -1844,6 +1850,7 @@ class FluxEpochTrainLoop:
             network_trainer.optimizer_train_fn()  
               
             validation_images = []  
+            lora_file_paths = []
             loss_data_path = ""  
               
             # 训练循环  
@@ -1869,8 +1876,9 @@ class FluxEpochTrainLoop:
                   
                 # 检查是否需要保存  
                 if current_epoch % save_every_n_epochs == 0:  
-                    self.save(network_trainer)  
-                    print(f"Model saved at epoch {current_epoch}")  
+                    lora_file_path = self.save(network_trainer)
+                    lora_file_paths.append(lora_file_path)
+                    print(f"Model saved at epoch {current_epoch}, lora file path: {lora_file_path}")  
                   
                 # 导出损失数据  
                 if export_loss_data:  
@@ -1882,15 +1890,36 @@ class FluxEpochTrainLoop:
               
             # 最终验证和保存  
             if len(validation_images) == 0:  
-                validation_images = self.validate(network_trainer, validation_settings)  
-                validation_images.append(validation_images)
+                print("No validation images found, running final validation") 
+                final_validation_images = self.validate(network_trainer, validation_settings)
+                validation_images = final_validation_images
+            else:
+                # 如果有多个验证结果，将它们合并成一个张量
+                # 每个 validation_images[i] 可能包含多张图片
+                all_images = []
+                for val_images in validation_images:
+                    if val_images.dim() == 4:  # (B, H, W, C)
+                        all_images.append(val_images)
+                    elif val_images.dim() == 3:  # (H, W, C)
+                        all_images.append(val_images.unsqueeze(0))
+                
+                if all_images:
+                    validation_images = torch.cat(all_images, dim=0)
+                else:
+                    validation_images = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
               
             trainer = {  
                 "network_trainer": network_trainer,  
                 "training_loop": training_loop,  
             }  
+            # 将lora_file_paths转换为字符串
+            lora_file_paths = [os.path.abspath(path) for path in lora_file_paths]
+            lora_file_paths = "\n".join(lora_file_paths)
+            # 将loss_data转换为字符串
+            loss_data = [str(loss) for loss in network_trainer.loss_recorder.global_loss_list]
+            loss_data = "\n".join(loss_data)
               
-            return (trainer, current_epoch, validation_images, loss_data_path)  
+            return (trainer, current_epoch, validation_images, lora_file_paths, loss_data, loss_data_path) 
   
     def validate(self, network_trainer, validation_settings=None):  
         params = (   
@@ -1899,21 +1928,32 @@ class FluxEpochTrainLoop:
             validation_settings  
         )  
         network_trainer.optimizer_eval_fn()  
-        image_tensors = network_trainer.sample_images(*params)  
-        network_trainer.optimizer_train_fn()  
+        image_tensors = None
+        with torch.inference_mode(False):
+            image_tensors = network_trainer.sample_images(*params) 
           
         # 转换图像张量格式以便输出  
-        if image_tensors is not None:  
-            return (0.5 * (image_tensors + 1.0)).cpu().float()  
+        if image_tensors is not None: 
+            print(f"Validation images: {image_tensors.shape}")
+            # 确保数据类型和值范围正确
+            processed_images = (0.5 * (image_tensors + 1.0)).cpu().float()
+            # 确保数据类型是 float32 并且值在 [0, 1] 范围内
+            processed_images = torch.clamp(processed_images, 0.0, 1.0)
+            return processed_images
         else:  
             # 返回空图像张量  
-            return torch.zeros((1, 512, 512, 3))  
+            print("No validation images found, returning empty image tensor")
+            return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
   
     def save(self, network_trainer):  
         ckpt_name = train_util.get_step_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as, network_trainer.global_step)  
         network_trainer.optimizer_eval_fn()  
         network_trainer.save_model(ckpt_name, network_trainer.accelerator.unwrap_model(network_trainer.network), network_trainer.global_step, network_trainer.current_epoch.value + 1)  
         network_trainer.optimizer_train_fn()  
+        # return save path
+        save_path = os.path.join(network_trainer.args.output_dir, ckpt_name)
+        print(f"Model saved at {save_path}")
+        return os.path.abspath(save_path)
   
     def export_loss_data(self, network_trainer, current_epoch):  
         """导出损失数据到 CSV 文件"""  
