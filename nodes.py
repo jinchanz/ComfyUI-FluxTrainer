@@ -21,6 +21,7 @@ from .flux_train_network_comfy import FluxNetworkTrainer
 from .library import flux_train_utils as  flux_train_utils
 from .flux_train_comfy import FluxTrainer
 from .flux_train_comfy import setup_parser as train_setup_parser
+from .sdxl_train_network import SdxlNetworkTrainer
 from .library.device_utils import init_ipex
 init_ipex()
 
@@ -1984,6 +1985,482 @@ class FluxEpochTrainLoop:
             print(f"Error exporting loss data: {e}")  
             return ""
 
+class FluxTrainingConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "flux_models": ("TRAIN_FLUX_MODELS",),
+            "dataset": ("JSON",),
+            "optimizer_settings": ("ARGS",),
+            "output_name": ("STRING", {"default": "flux_lora", "multiline": False}),
+            "output_dir": ("STRING", {"default": "flux_trainer_output", "multiline": False, "tooltip": "path to dataset, root is the 'ComfyUI' folder, with windows portable 'ComfyUI_windows_portable'"}),
+            "network_dim": ("INT", {"default": 4, "min": 1, "max": 100000, "step": 1, "tooltip": "network dim"}),
+            "network_alpha": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2048.0, "step": 0.01, "tooltip": "network alpha"}),
+            "learning_rate": ("FLOAT", {"default": 4e-4, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "learning rate"}),
+            "max_train_steps": ("INT", {"default": 1500, "min": 1, "max": 100000, "step": 1, "tooltip": "max number of training steps"}),
+            "apply_t5_attn_mask": ("BOOLEAN", {"default": True, "tooltip": "apply t5 attention mask"}),
+            "cache_latents": (["disk", "memory", "disabled"], {"tooltip": "caches text encoder outputs"}),
+            "cache_text_encoder_outputs": (["disk", "memory", "disabled"], {"tooltip": "caches text encoder outputs"}),
+            "blocks_to_swap": ("INT", {"default": 0, "tooltip": "Previously known as split_mode, number of blocks to swap to save memory, default to enable is 18"}),
+            "weighting_scheme": (["logit_normal", "sigma_sqrt", "mode", "cosmap", "none"],),
+            "logit_mean": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "mean to use when using the logit_normal weighting scheme"}),
+            "logit_std": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,"tooltip": "std to use when using the logit_normal weighting scheme"}),
+            "mode_scale": ("FLOAT", {"default": 1.29, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Scale of mode weighting scheme. Only effective when using the mode as the weighting_scheme"}),
+            "timestep_sampling": (["sigmoid", "uniform", "sigma", "shift", "flux_shift"], {"tooltip": "Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal and shift of sigmoid (recommend value of 3.1582 for discrete_flow_shift)"}),
+            "sigmoid_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1, "tooltip": "Scale factor for sigmoid timestep sampling (only used when timestep-sampling is sigmoid"}),
+            "model_prediction_type": (["raw", "additive", "sigma_scaled"], {"tooltip": "How to interpret and process the model prediction: raw (use as is), additive (add to noisy input), sigma_scaled (apply sigma scaling)."}),
+            "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 32.0, "step": 0.01, "tooltip": "guidance scale, for Flux training should be 1.0"}),
+            "discrete_flow_shift": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.0001, "tooltip": "for the Euler Discrete Scheduler, default is 3.0"}),
+            "highvram": ("BOOLEAN", {"default": False, "tooltip": "memory mode"}),
+            "fp8_base": ("BOOLEAN", {"default": True, "tooltip": "use fp8 for base model"}),
+            "gradient_dtype": (["fp32", "fp16", "bf16"], {"default": "fp32", "tooltip": "the actual dtype training uses"}),
+            "save_dtype": (["fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e5m2"], {"default": "bf16", "tooltip": "the dtype to save checkpoints as"}),
+            "attention_mode": (["sdpa", "xformers", "disabled"], {"default": "sdpa", "tooltip": "memory efficient attention mode"}),
+            "sample_prompts": ("STRING", {"multiline": True, "default": "illustration of a kitten | photograph of a turtle", "tooltip": "validation sample prompts, for multiple prompts, separate by `|`"}),
+            },
+            "optional": {
+                "additional_args": ("STRING", {"multiline": True, "default": "", "tooltip": "additional args to pass to the training command"}),
+                "resume_args": ("ARGS", {"default": "", "tooltip": "resume args to pass to the training command"}),
+                "train_text_encoder": (['disabled', 'clip_l', 'clip_l_fp8', 'clip_l+T5', 'clip_l+T5_fp8'], {"default": 'disabled', "tooltip": "also train the selected text encoders using specified dtype, T5 can not be trained without clip_l"}),
+                "clip_l_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "text encoder learning rate"}),
+                "T5_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "text encoder learning rate"}),
+                "block_args": ("ARGS", {"default": "", "tooltip": "limit the blocks used in the LoRA"}),
+                "gradient_checkpointing": (["enabled", "enabled_with_cpu_offloading", "disabled"], {"default": "enabled", "tooltip": "use gradient checkpointing"}),
+                "loss_args": ("ARGS", {"default": "", "tooltip": "loss args"}),
+                "network_config": ("NETWORK_CONFIG", {"tooltip": "additional network config"}),
+            },
+            "hidden": {
+                "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ("FLUX_TRAINING_CONFIG",)
+    RETURN_NAMES = ("flux_training_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "FluxTrainer"
+
+    def create_config(self, flux_models, dataset, optimizer_settings, sample_prompts, output_name, attention_mode, 
+                      gradient_dtype, save_dtype, additional_args=None, resume_args=None, train_text_encoder='disabled', 
+                      block_args=None, gradient_checkpointing="enabled", prompt=None, extra_pnginfo=None, clip_l_lr=0, T5_lr=0, loss_args=None, network_config=None, **kwargs):
+        
+        output_dir = os.path.abspath(kwargs.get("output_dir"))
+        os.makedirs(output_dir, exist_ok=True)
+    
+        total, used, free = shutil.disk_usage(output_dir)
+        required_free_space = 2 * (2**30)
+        if free <= required_free_space:
+            raise ValueError(f"Insufficient disk space. Required: {required_free_space/2**30}GB. Available: {free/2**30}GB")
+        
+        dataset_config = dataset["datasets"]
+        dataset_toml = toml.dumps(json.loads(dataset_config))
+
+        parser = train_network_setup_parser()
+        flux_train_utils.add_flux_train_arguments(parser)
+
+        if additional_args is not None:
+            print(f"additional_args: {additional_args}")
+            args, _ = parser.parse_known_args(args=shlex.split(additional_args))
+        else:
+            args, _ = parser.parse_known_args()
+
+        if kwargs.get("cache_latents") == "memory":
+            kwargs["cache_latents"] = True
+            kwargs["cache_latents_to_disk"] = False
+        elif kwargs.get("cache_latents") == "disk":
+            kwargs["cache_latents"] = True
+            kwargs["cache_latents_to_disk"] = True
+            kwargs["caption_dropout_rate"] = 0.0
+            kwargs["shuffle_caption"] = False
+            kwargs["token_warmup_step"] = 0.0
+            kwargs["caption_tag_dropout_rate"] = 0.0
+        else:
+            kwargs["cache_latents"] = False
+            kwargs["cache_latents_to_disk"] = False
+
+        if kwargs.get("cache_text_encoder_outputs") == "memory":
+            kwargs["cache_text_encoder_outputs"] = True
+            kwargs["cache_text_encoder_outputs_to_disk"] = False
+        elif kwargs.get("cache_text_encoder_outputs") == "disk":
+            kwargs["cache_text_encoder_outputs"] = True
+            kwargs["cache_text_encoder_outputs_to_disk"] = True
+        else:
+            kwargs["cache_text_encoder_outputs"] = False
+            kwargs["cache_text_encoder_outputs_to_disk"] = False
+
+        if '|' in sample_prompts:
+            prompts = sample_prompts.split('|')
+        else:
+            prompts = [sample_prompts]
+
+        config_dict = {
+            "sample_prompts": prompts,
+            "save_precision": save_dtype,
+            "mixed_precision": "bf16",
+            "num_cpu_threads_per_process": 1,
+            "pretrained_model_name_or_path": flux_models["transformer"],
+            "clip_l": flux_models["clip_l"],
+            "t5xxl": flux_models["t5"],
+            "ae": flux_models["vae"],
+            "save_model_as": "safetensors",
+            "persistent_data_loader_workers": False,
+            "max_data_loader_n_workers": 0,
+            "seed": 42,
+            "network_module": ".networks.lora_flux" if network_config is None else network_config["network_module"],
+            "dataset_config": dataset_toml,
+            "output_name": f"{output_name}_rank{kwargs.get('network_dim')}_{save_dtype}",
+            "loss_type": "l2",
+            "t5xxl_max_token_length": 512,
+            "alpha_mask": dataset["alpha_mask"],
+            "network_train_unet_only": True if train_text_encoder == 'disabled' else False,
+            "fp8_base_unet": True if "fp8" in train_text_encoder else False,
+            "disable_mmap_load_safetensors": False,
+            "network_args": None if network_config is None else network_config["network_args"],
+        }
+        
+        attention_settings = {
+            "sdpa": {"mem_eff_attn": True, "xformers": False, "spda": True},
+            "xformers": {"mem_eff_attn": True, "xformers": True, "spda": False}
+        }
+        config_dict.update(attention_settings.get(attention_mode, {}))
+
+        gradient_dtype_settings = {
+            "fp16": {"full_fp16": True, "full_bf16": False, "mixed_precision": "fp16"},
+            "bf16": {"full_bf16": True, "full_fp16": False, "mixed_precision": "bf16"}
+        }
+        config_dict.update(gradient_dtype_settings.get(gradient_dtype, {}))
+
+        if train_text_encoder != 'disabled':
+            if clip_l_lr != 0:
+                config_dict["text_encoder_lr"] = clip_l_lr
+            if T5_lr != 0:
+                config_dict["text_encoder_lr"] = [clip_l_lr, T5_lr]
+
+        if gradient_checkpointing == "disabled":
+            config_dict["gradient_checkpointing"] = False
+        elif gradient_checkpointing == "enabled_with_cpu_offloading":
+            config_dict["gradient_checkpointing"] = True
+            config_dict["cpu_offload_checkpointing"] = True
+        else:
+            config_dict["gradient_checkpointing"] = True
+
+        if flux_models["lora_path"]:
+            config_dict["network_weights"] = flux_models["lora_path"]
+
+        config_dict.update(kwargs)
+        config_dict.update(optimizer_settings)
+
+        if loss_args:
+            config_dict.update(loss_args)
+
+        if resume_args:
+            config_dict.update(resume_args)
+
+        for key, value in config_dict.items():
+            setattr(args, key, value)
+
+        additional_network_args = []
+        
+        if "T5" in train_text_encoder:
+            additional_network_args.append("train_t5xxl=True")
+       
+        if block_args:
+            additional_network_args.append(block_args["include"])
+        
+        if hasattr(args, 'network_args') and isinstance(args.network_args, list):
+            args.network_args.extend(additional_network_args)
+        else:
+            setattr(args, 'network_args', additional_network_args)
+        
+        saved_args_file_path = os.path.join(output_dir, f"{output_name}_args.json")
+        with open(saved_args_file_path, 'w') as f:
+            json.dump(vars(args), f, indent=4)
+
+        metadata = {}
+        if extra_pnginfo is not None:
+            metadata.update(extra_pnginfo["workflow"])
+       
+        saved_workflow_file_path = os.path.join(output_dir, f"{output_name}_workflow.json")
+        with open(saved_workflow_file_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+
+        training_config = {
+            "args": args,
+            "config_dict": config_dict,
+            "output_dir": output_dir,
+            "output_name": output_name,
+            "flux_models": flux_models,
+            "train_text_encoder": train_text_encoder,
+            "metadata": {
+                "saved_args_file_path": saved_args_file_path,
+                "saved_workflow_file_path": saved_workflow_file_path,
+                "total_disk_space": total,
+                "used_disk_space": used,
+                "free_disk_space": free,
+            },
+            "raw_params": {
+                "dataset": dataset,
+                "optimizer_settings": optimizer_settings,
+                "sample_prompts": sample_prompts,
+                "attention_mode": attention_mode,
+                "gradient_dtype": gradient_dtype,
+                "save_dtype": save_dtype,
+                "additional_args": additional_args,
+                "resume_args": resume_args,
+                "block_args": block_args,
+                "gradient_checkpointing": gradient_checkpointing,
+                "clip_l_lr": clip_l_lr,
+                "T5_lr": T5_lr,
+                "loss_args": loss_args,
+                "network_config": network_config,
+                "kwargs": kwargs
+            }
+        }
+        
+        return (training_config,)
+    
+class InitTraining:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "architecture": (["flux", "sdxl"], {"default": "flux", "tooltip": "architecture of the model to train"}),
+            },
+            "optional": {
+                "flux_training_config": ("FLUX_TRAINING_CONFIG",),
+                "flux_validation_settings": ("VALSETTINGS",),
+                "sdxl_training_config": ("SDXL_TRAINING_CONFIG",),
+                "sdxl_validation_settings": ("VALSETTINGS",),
+            }
+        }
+
+    RETURN_TYPES = ("NETWORKTRAINER", "ARCHITECTURE", "VALSETTINGS", "INT", "KOHYA_ARGS",)
+    RETURN_NAMES = ("network_trainer", "architecture", "validation_settings", "epochs_count", "args",)
+    FUNCTION = "init_training"
+    CATEGORY = "FluxTrainer"
+
+    def init_training(self, architecture, flux_training_config=None, flux_validation_settings=None, 
+                      sdxl_training_config=None, sdxl_validation_settings=None):
+        
+        mm.soft_empty_cache()
+
+        validation_settings = flux_validation_settings
+        
+        with torch.inference_mode(False):
+            if architecture == "flux":
+                if flux_training_config is None or flux_validation_settings is None:
+                    raise ValueError("Flux training config and validation settings are required when architecture is 'flux'")
+                args = flux_training_config["args"]
+                network_trainer = FluxNetworkTrainer()
+            else:  # sdxl
+                if sdxl_training_config is None or sdxl_validation_settings is None:
+                    raise ValueError("SDXL training config and validation settings are required when architecture is 'sdxl'")
+                args = sdxl_training_config["args"]
+                network_trainer = SdxlNetworkTrainer()
+                validation_settings = sdxl_validation_settings
+                
+            training_loop = network_trainer.init_train(args)
+
+        epochs_count = network_trainer.num_train_epochs
+
+        trainer = {
+            "network_trainer": network_trainer,
+            "training_loop": training_loop,
+        }
+
+        print(f"Inited training for architecture: {architecture}")
+        
+        return (trainer, architecture, validation_settings, epochs_count, args)
+    
+class EpochTrainLoop:  
+    @classmethod  
+    def INPUT_TYPES(cls):  
+        return {"required": {  
+            "network_trainer": ("NETWORKTRAINER",),  
+            "architecture": ("ARCHITECTURE",),
+            "validate_every_n_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "validate and generate images every n epochs"}),  
+            "save_every_n_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1, "tooltip": "save model every n epochs"}),  
+            "export_loss_data": ("BOOLEAN", {"default": True, "tooltip": "export loss data to CSV file"}),  
+            },  
+             "optional": {  
+                "validation_settings": ("VALSETTINGS",),  
+            }  
+        }  
+  
+    RETURN_TYPES = ("NETWORKTRAINER", "INT", "IMAGE", "STRING", "STRING", "STRING",)  
+    RETURN_NAMES = ("network_trainer", "completed_epochs", "validation_images", "lora_file_paths", "loss_data", "loss_data_path",)  
+    FUNCTION = "train"  
+    CATEGORY = "FluxTrainer"  
+  
+    def train(self, network_trainer, architecture, validate_every_n_epochs, save_every_n_epochs, export_loss_data, validation_settings=None):  
+        with torch.inference_mode(False):  
+            training_loop = network_trainer["training_loop"]  
+            network_trainer = network_trainer["network_trainer"]  
+              
+            # 计算每个 epoch 的步数  
+            args = network_trainer.args  
+            num_update_steps_per_epoch = math.ceil(len(network_trainer.train_dataloader) / args.gradient_accumulation_steps)  
+              
+            # 如果设置了 max_train_epochs，使用它；否则从 max_train_steps 计算  
+            if hasattr(args, 'max_train_epochs') and args.max_train_epochs is not None:  
+                target_epochs = args.max_train_epochs  
+                target_global_step = target_epochs * num_update_steps_per_epoch  
+            else:  
+                target_global_step = args.max_train_steps  
+                target_epochs = math.ceil(target_global_step / num_update_steps_per_epoch)  
+              
+            comfy_pbar = comfy.utils.ProgressBar(target_global_step)  
+            network_trainer.comfy_pbar = comfy_pbar  
+              
+            network_trainer.optimizer_train_fn()  
+              
+            validation_images = []  
+            lora_file_paths = []
+            loss_data_path = ""  
+              
+            # 训练循环  
+            current_epoch = 0  
+            while current_epoch < target_epochs and network_trainer.global_step < target_global_step:  
+                # 计算当前 epoch 结束时的步数  
+                epoch_end_step = (current_epoch + 1) * num_update_steps_per_epoch  
+                epoch_end_step = min(epoch_end_step, target_global_step)  
+                  
+                # 运行一个完整的 epoch  
+                steps_done = training_loop(  
+                    break_at_steps=epoch_end_step,  
+                    epoch=current_epoch,  
+                )  
+                  
+                current_epoch += 1  
+                  
+                # 检查是否需要验证  
+                if current_epoch % validate_every_n_epochs == 0:  
+                    current_validation_images = self.validate(network_trainer, architecture, validation_settings) 
+                    validation_images.append(current_validation_images)
+                    print(f"Validation completed at epoch {current_epoch}")  
+                  
+                # 检查是否需要保存  
+                if current_epoch % save_every_n_epochs == 0:  
+                    lora_file_path = self.save(network_trainer)
+                    lora_file_paths.append(lora_file_path)
+                    print(f"Model saved at epoch {current_epoch}, lora file path: {lora_file_path}")  
+                  
+                # 导出损失数据  
+                if export_loss_data:  
+                    loss_data_path = self.export_loss_data(network_trainer, current_epoch)  
+                  
+                # 如果达到最大训练步数则退出  
+                if network_trainer.global_step >= target_global_step:  
+                    break  
+              
+            # 最终验证和保存  
+            if len(validation_images) == 0:  
+                print("No validation images found, running final validation") 
+                final_validation_images = self.validate(network_trainer, architecture, validation_settings)
+                validation_images = final_validation_images
+            else:
+                # 如果有多个验证结果，将它们合并成一个张量
+                # 每个 validation_images[i] 可能包含多张图片
+                all_images = []
+                for val_images in validation_images:
+                    if val_images.dim() == 4:  # (B, H, W, C)
+                        all_images.append(val_images)
+                    elif val_images.dim() == 3:  # (H, W, C)
+                        all_images.append(val_images.unsqueeze(0))
+                
+                if all_images:
+                    validation_images = torch.cat(all_images, dim=0)
+                else:
+                    validation_images = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+              
+            trainer = {  
+                "network_trainer": network_trainer,  
+                "training_loop": training_loop,  
+            }  
+            # 将lora_file_paths转换为字符串
+            lora_file_paths = [os.path.abspath(path) for path in lora_file_paths]
+            lora_file_paths = "\n".join(lora_file_paths)
+            # 将loss_data转换为字符串
+            loss_data = [str(loss) for loss in network_trainer.loss_recorder.global_loss_list]
+            loss_data = "\n".join(loss_data)
+              
+            return (trainer, current_epoch, validation_images, lora_file_paths, loss_data, loss_data_path) 
+  
+    def validate(self, network_trainer, architecture, validation_settings=None):  
+        if (architecture == "flux"):
+            params = (   
+                network_trainer.current_epoch.value,   
+                network_trainer.global_step,  
+                validation_settings  
+            )  
+        else:  # sdxl
+            params = (   
+                network_trainer.accelerator,   
+                network_trainer.args,  
+                network_trainer.current_epoch.value,   
+                network_trainer.global_step,  
+                network_trainer.accelerator.device,  
+                network_trainer.vae,  
+                network_trainer.tokenizers,  
+                network_trainer.text_encoder,  
+                network_trainer.unet,  
+                validation_settings  
+            )
+        network_trainer.optimizer_eval_fn()  
+        image_tensors = None
+        with torch.inference_mode(False):
+            image_tensors = network_trainer.sample_images(*params) 
+          
+        # 转换图像张量格式以便输出  
+        if image_tensors is not None: 
+            print(f"Validation images: {image_tensors.shape}")
+            # 确保数据类型和值范围正确
+            processed_images = (0.5 * (image_tensors + 1.0)).cpu().float()
+            # 确保数据类型是 float32 并且值在 [0, 1] 范围内
+            processed_images = torch.clamp(processed_images, 0.0, 1.0)
+            return processed_images
+        else:  
+            # 返回空图像张量  
+            print("No validation images found, returning empty image tensor")
+            return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+  
+    def save(self, network_trainer):  
+        ckpt_name = train_util.get_step_ckpt_name(network_trainer.args, "." + network_trainer.args.save_model_as, network_trainer.global_step)  
+        network_trainer.optimizer_eval_fn()  
+        network_trainer.save_model(ckpt_name, network_trainer.accelerator.unwrap_model(network_trainer.network), network_trainer.global_step, network_trainer.current_epoch.value + 1)  
+        network_trainer.optimizer_train_fn()  
+        # return save path
+        save_path = os.path.join(network_trainer.args.output_dir, ckpt_name)
+        print(f"Model saved at {save_path}")
+        return os.path.abspath(save_path)
+  
+    def export_loss_data(self, network_trainer, current_epoch):  
+        """导出损失数据到 CSV 文件"""  
+        try:  
+            loss_values = network_trainer.loss_recorder.global_loss_list  
+              
+            if not loss_values:  
+                return ""  
+              
+            # 创建输出目录  
+            output_dir = network_trainer.args.output_dir  
+            loss_data_path = os.path.join(output_dir, f"loss_data_epoch_{current_epoch}.csv")  
+              
+            # 写入 CSV 文件  
+            with open(loss_data_path, 'w', newline='', encoding='utf-8') as csvfile:  
+                writer = csv.writer(csvfile)  
+                writer.writerow(['Step', 'Loss', 'Epoch'])  
+                  
+                for i, loss in enumerate(loss_values):  
+                    # 估算对应的 epoch（简化计算）  
+                    estimated_epoch = i // (len(loss_values) // max(current_epoch, 1)) + 1  
+                    writer.writerow([i + 1, loss, estimated_epoch])  
+              
+            print(f"Loss data exported to: {loss_data_path}")  
+            return loss_data_path  
+              
+        except Exception as e:  
+            print(f"Error exporting loss data: {e}")  
+            return ""
+
 NODE_CLASS_MAPPINGS = {
     "InitFluxLoRATraining": InitFluxLoRATraining,
     "InitFluxTraining": InitFluxTraining,
@@ -2012,7 +2489,11 @@ NODE_CLASS_MAPPINGS = {
     "TrainNetworkConfig": TrainNetworkConfig,
     "FluxEpochTrainLoop": FluxEpochTrainLoop,
     "DataSetDownloader": DataSetDownloader,
+    "FluxTrainingConfig": FluxTrainingConfig,
+    "InitTraining": InitTraining,
+    "EpochTrainLoop": EpochTrainLoop,
 }
+
 NODE_DISPLAY_NAME_MAPPINGS = {
     "InitFluxLoRATraining": "Init Flux LoRA Training",
     "InitFluxTraining": "Init Flux Training",
@@ -2041,4 +2522,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TrainNetworkConfig": "Train Network Config",
     "FluxEpochTrainLoop": "Flux Epoch Train Loop",
     "DataSetDownloader": "DataSet Downloader",
+    "FluxTrainingConfig": "Flux Training Config",
+    "InitTraining": "Init Training",
+    "EpochTrainLoop": "Epoch Train Loop",
 }
