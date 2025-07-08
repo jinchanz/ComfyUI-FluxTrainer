@@ -453,16 +453,234 @@ class SDXLTrainValidate:
         processed_images = torch.clamp(processed_images, 0.0, 1.0)
         return (trainer, processed_images)
     
+class SDXLTrainingConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "SDXL_models": ("TRAIN_SDXL_MODELS",),
+            "dataset": ("JSON",),
+            "optimizer_settings": ("ARGS",),
+            "output_name": ("STRING", {"default": "SDXL_lora", "multiline": False}),
+            "output_dir": ("STRING", {"default": "SDXL_trainer_output", "multiline": False, "tooltip": "path to dataset, root is the 'ComfyUI' folder, with windows portable 'ComfyUI_windows_portable'"}),
+            "network_dim": ("INT", {"default": 16, "min": 1, "max": 100000, "step": 1, "tooltip": "network dim"}),
+            "network_alpha": ("FLOAT", {"default": 16, "min": 0.0, "max": 2048.0, "step": 0.01, "tooltip": "network alpha"}),
+            "learning_rate": ("FLOAT", {"default": 1e-6, "min": 0.0, "max": 10.0, "step": 0.0000001, "tooltip": "learning rate"}),
+            "max_train_steps": ("INT", {"default": 1500, "min": 1, "max": 100000, "step": 1, "tooltip": "max number of training steps"}),
+            "cache_latents": (["disk", "memory", "disabled"], {"tooltip": "caches latents"}),
+            "cache_text_encoder_outputs": (["disk", "memory", "disabled"], {"tooltip": "caches text encoder outputs"}),
+            "highvram": ("BOOLEAN", {"default": False, "tooltip": "memory mode"}),
+            "blocks_to_swap": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "option for memory use reduction. The maximum number of blocks that can be swapped is 36 for SDXL.5L and 22 for SDXL.5M"}),
+            "fp8_base": ("BOOLEAN", {"default": False, "tooltip": "use fp8 for base model"}),
+            "gradient_dtype": (["fp32", "fp16", "bf16"], {"default": "fp32", "tooltip": "the actual dtype training uses"}),
+            "save_dtype": (["fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e5m2"], {"default": "fp16", "tooltip": "the dtype to save checkpoints as"}),
+            "attention_mode": (["sdpa", "xformers", "disabled"], {"default": "sdpa", "tooltip": "memory efficient attention mode"}),
+            "train_text_encoder": (['disabled', 'clip_l'], {"default": 'disabled', "tooltip": "also train the selected text encoders"}),
+            "clip_l_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "CLIP-L text encoder learning rate"}),
+            "clip_g_lr": ("FLOAT", {"default": 0, "min": 0.0, "max": 10.0, "step": 0.000001, "tooltip": "CLIP-G text encoder learning rate"}),
+            "sample_prompts_pos": ("STRING", {"multiline": True, "default": "illustration of a kitten | photograph of a turtle", "tooltip": "validation sample prompts, for multiple prompts, separate by `|`"}),
+            "sample_prompts_neg": ("STRING", {"multiline": True, "default": "", "tooltip": "negative validation sample prompts, for multiple prompts, separate by `|`"}),
+            "gradient_checkpointing": (["enabled", "disabled"], {"default": "enabled", "tooltip": "use gradient checkpointing"}),
+            },
+            "optional": {
+                "additional_args": ("STRING", {"multiline": True, "default": "", "tooltip": "additional args to pass to the training command"}),
+                "resume_args": ("ARGS", {"default": "", "tooltip": "resume args to pass to the training command"}),
+                "block_args": ("ARGS", {"default": "", "tooltip": "limit the blocks used in the LoRA"}),
+                "loss_args": ("ARGS", {"default": "", "tooltip": "loss args"}),
+                "network_config": ("NETWORK_CONFIG", {"tooltip": "additional network config"}),
+            },
+            "hidden": {
+                "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    RETURN_TYPES = ("SDXL_TRAINING_CONFIG",)
+    RETURN_NAMES = ("sdxl_training_config",)
+    FUNCTION = "create_config"
+    CATEGORY = "FluxTrainer/SDXL"
+
+    def create_config(self, SDXL_models, dataset, optimizer_settings, sample_prompts_pos, sample_prompts_neg, output_name, attention_mode, 
+                      gradient_dtype, save_dtype, additional_args=None, resume_args=None, train_text_encoder='disabled', 
+                      gradient_checkpointing="enabled", prompt=None, extra_pnginfo=None, clip_l_lr=0, clip_g_lr=0, loss_args=None, network_config=None, **kwargs):
+        
+        output_dir = os.path.abspath(kwargs.get("output_dir"))
+        os.makedirs(output_dir, exist_ok=True)
+    
+        total, used, free = shutil.disk_usage(output_dir)
+        required_free_space = 2 * (2**30)
+        if free <= required_free_space:
+            raise ValueError(f"Insufficient disk space. Required: {required_free_space/2**30}GB. Available: {free/2**30}GB")
+        
+        dataset_config = dataset["datasets"]
+        dataset_toml = toml.dumps(json.loads(dataset_config))
+
+        parser = train_network_setup_parser()
+        # sdxl_train_util.add_sdxl_training_arguments(parser)  # 如果有 SDXL 特定参数则取消注释
+
+        if additional_args is not None:
+            print(f"additional_args: {additional_args}")
+            args, _ = parser.parse_known_args(args=shlex.split(additional_args))
+        else:
+            args, _ = parser.parse_known_args()
+
+        if kwargs.get("cache_latents") == "memory":
+            kwargs["cache_latents"] = True
+            kwargs["cache_latents_to_disk"] = False
+        elif kwargs.get("cache_latents") == "disk":
+            kwargs["cache_latents"] = True
+            kwargs["cache_latents_to_disk"] = True
+            kwargs["caption_dropout_rate"] = 0.0
+            kwargs["shuffle_caption"] = False
+            kwargs["token_warmup_step"] = 0.0
+            kwargs["caption_tag_dropout_rate"] = 0.0
+        else:
+            kwargs["cache_latents"] = False
+            kwargs["cache_latents_to_disk"] = False
+
+        if kwargs.get("cache_text_encoder_outputs") == "memory":
+            kwargs["cache_text_encoder_outputs"] = True
+            kwargs["cache_text_encoder_outputs_to_disk"] = False
+        elif kwargs.get("cache_text_encoder_outputs") == "disk":
+            kwargs["cache_text_encoder_outputs"] = True
+            kwargs["cache_text_encoder_outputs_to_disk"] = True
+        else:
+            kwargs["cache_text_encoder_outputs"] = False
+            kwargs["cache_text_encoder_outputs_to_disk"] = False
+
+        if '|' in sample_prompts_pos:
+            positive_prompts = sample_prompts_pos.split('|')
+        else:
+            positive_prompts = [sample_prompts_pos]
+
+        if '|' in sample_prompts_neg:
+            negative_prompts = sample_prompts_neg.split('|')
+        else:
+            negative_prompts = [sample_prompts_neg] if sample_prompts_neg else [""]
+
+        config_dict = {
+            "sample_prompts": positive_prompts,
+            "negative_prompts": negative_prompts,
+            "save_precision": save_dtype,
+            "mixed_precision": "bf16",
+            "num_cpu_threads_per_process": 1,
+            "pretrained_model_name_or_path": SDXL_models["checkpoint"],
+            "save_model_as": "safetensors",
+            "persistent_data_loader_workers": False,
+            "max_data_loader_n_workers": 0,
+            "seed": 42,
+            "network_module": ".networks.lora" if network_config is None else network_config["network_module"],
+            "dataset_config": dataset_toml,
+            "output_name": f"{output_name}_rank{kwargs.get('network_dim')}_{save_dtype}",
+            "loss_type": "l2",
+            "alpha_mask": dataset["alpha_mask"],
+            "network_train_unet_only": True if train_text_encoder == 'disabled' else False,
+            "disable_mmap_load_safetensors": False,
+            "network_args": None if network_config is None else network_config["network_args"],
+        }
+        
+        attention_settings = {
+            "sdpa": {"mem_eff_attn": True, "xformers": False, "spda": True},
+            "xformers": {"mem_eff_attn": True, "xformers": True, "spda": False}
+        }
+        config_dict.update(attention_settings.get(attention_mode, {}))
+
+        gradient_dtype_settings = {
+            "fp16": {"full_fp16": True, "full_bf16": False, "mixed_precision": "fp16"},
+            "bf16": {"full_bf16": True, "full_fp16": False, "mixed_precision": "bf16"}
+        }
+        config_dict.update(gradient_dtype_settings.get(gradient_dtype, {}))
+
+        if train_text_encoder != 'disabled':
+            config_dict["text_encoder_lr"] = [clip_l_lr, clip_g_lr]
+
+        if gradient_checkpointing == "disabled":
+            config_dict["gradient_checkpointing"] = False
+        else:
+            config_dict["gradient_checkpointing"] = True
+
+        if SDXL_models["lora_path"]:
+            config_dict["network_weights"] = SDXL_models["lora_path"]
+
+        config_dict.update(kwargs)
+        config_dict.update(optimizer_settings)
+
+        if loss_args:
+            config_dict.update(loss_args)
+
+        if resume_args:
+            config_dict.update(resume_args)
+
+        for key, value in config_dict.items():
+            setattr(args, key, value)
+
+        additional_network_args = []
+        
+        if kwargs.get("block_args"):
+            additional_network_args.append(kwargs["block_args"]["include"])
+        
+        if hasattr(args, 'network_args') and isinstance(args.network_args, list):
+            args.network_args.extend(additional_network_args)
+        else:
+            setattr(args, 'network_args', additional_network_args)
+        
+        saved_args_file_path = os.path.join(output_dir, f"{output_name}_args.json")
+        with open(saved_args_file_path, 'w') as f:
+            json.dump(vars(args), f, indent=4)
+
+        metadata = {}
+        if extra_pnginfo is not None:
+            metadata.update(extra_pnginfo["workflow"])
+       
+        saved_workflow_file_path = os.path.join(output_dir, f"{output_name}_workflow.json")
+        with open(saved_workflow_file_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+
+        training_config = {
+            "args": args,
+            "config_dict": config_dict,
+            "output_dir": output_dir,
+            "output_name": output_name,
+            "sdxl_models": SDXL_models,
+            "train_text_encoder": train_text_encoder,
+            "metadata": {
+                "saved_args_file_path": saved_args_file_path,
+                "saved_workflow_file_path": saved_workflow_file_path,
+                "total_disk_space": total,
+                "used_disk_space": used,
+                "free_disk_space": free,
+            },
+            "raw_params": {
+                "dataset": dataset,
+                "optimizer_settings": optimizer_settings,
+                "sample_prompts_pos": sample_prompts_pos,
+                "sample_prompts_neg": sample_prompts_neg,
+                "attention_mode": attention_mode,
+                "gradient_dtype": gradient_dtype,
+                "save_dtype": save_dtype,
+                "additional_args": additional_args,
+                "resume_args": resume_args,
+                "block_args": kwargs.get("block_args"),
+                "gradient_checkpointing": gradient_checkpointing,
+                "clip_l_lr": clip_l_lr,
+                "clip_g_lr": clip_g_lr,
+                "loss_args": loss_args,
+                "network_config": network_config,
+                "kwargs": kwargs
+            }
+        }
+        
+        return (training_config,)
+
 NODE_CLASS_MAPPINGS = {
     "SDXLModelSelect": SDXLModelSelect,
     "InitSDXLLoRATraining": InitSDXLLoRATraining,
     "SDXLTrainValidationSettings": SDXLTrainValidationSettings,
     "SDXLTrainValidate": SDXLTrainValidate,
-    
+    "SDXLTrainingConfig": SDXLTrainingConfig,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SDXLModelSelect": "SDXL Model Select",
     "InitSDXLLoRATraining": "Init SDXL LoRA Training",
     "SDXLTrainValidationSettings": "SDXL Train Validation Settings",
     "SDXLTrainValidate": "SDXL Train Validate",
+    "SDXLTrainingConfig": "SDXL Training Config",
 }
