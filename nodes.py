@@ -1792,7 +1792,15 @@ class DataSetDownloader:
         for data in dataset_json["data"]:
             # 2.1 下载图片到 dataset_dir
             image_url = data["imageUrl"]
-            image_path = os.path.join(dataset_dir, data["imageName"] + ".png")
+            image_name = data.get("imageName")
+            if not image_name:
+                filename = image_url.split("/")[-1].split("?")[0]
+                image_name = os.path.splitext(filename)[0]
+                if not image_name:
+                    import hashlib
+                    image_name = hashlib.md5(image_url.encode("utf-8")).hexdigest()
+
+            image_path = os.path.join(dataset_dir, image_name + ".png")
             if not os.path.exists(image_path):
                 print(f"Downloading image from {image_url} to {image_path}")
                 # 2.1.1 创建目录
@@ -1802,7 +1810,7 @@ class DataSetDownloader:
                 with open(image_path, "wb") as f:
                     f.write(response.content)
             # 2.2 创建 caption 文件，文件名与其 image_name 一致，内容为 tags 拼接
-            caption_path = os.path.join(dataset_dir, data["imageName"] + ".txt")
+            caption_path = os.path.join(dataset_dir, image_name + ".txt")
             with open(caption_path, "w") as f:
                 f.write(data["tags"])
         # 3. 返回 dataset_dir
